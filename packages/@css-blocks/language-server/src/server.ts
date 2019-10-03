@@ -1,17 +1,19 @@
 import {
   // Attribute,
-  Block,
+  // Block,
   // BlockClass,
-  BlockFactory,
+  Block,
   // Options,
   // isBlockClass,
+  BlockFactory,
   CssBlockError,
-  SourceRange,
-  Syntax,
   // errorHasRange,
+  Syntax,
   resolveConfiguration,
 } from "@css-blocks/core";
 import { BlockParser } from "@css-blocks/core/dist/src/BlockParser/BlockParser";
+import { preprocess } from "@glimmer/syntax";
+import * as fs from "fs";
 import { postcss } from "opticss";
 import * as path from "path";
 import {
@@ -20,9 +22,12 @@ import {
   // TextDocument,
   // Diagnostic,
   // DiagnosticSeverity,
+  Definition,
   DidChangeConfigurationNotification,
   InitializeParams,
+  Position,
   ProposedFeatures,
+  TextDocument,
   TextDocumentPositionParams,
   TextDocuments,
   createConnection,
@@ -30,8 +35,12 @@ import {
   // DidChangeTextDocumentParams,
   // Range
 } from "vscode-languageserver";
+import { URI } from "vscode-uri";
 
 import { DiagnosticsManager } from "./services/diagnostics";
+import { toPosition } from "./util/estTreeUtils";
+import { ASTPath } from "./util/glimmerUtils";
+import { hbsErrorParser } from "./util/hbsErrorParser";
 
 // Create a connection for the server. The connection uses Node's IPC as a transport.
 // Also include all preview / proposed LSP features.
@@ -66,6 +75,8 @@ connection.onInitialize((params: InitializeParams) => {
     capabilities: {
       textDocumentSync: documents.syncKind,
       definitionProvider: true,
+      // TODO: implement support for this for showing documentation
+      // hoverProvider: true,
       documentSymbolProvider: false,
       completionProvider: {
         resolveProvider: true,
@@ -143,157 +154,216 @@ const config = resolveConfiguration({});
 const factory = new BlockFactory(config, postcss);
 const parser = new BlockParser(config, factory);
 
-documents.onDidSave(_ => {
-  factory.reset();
-});
+function isBlockFile(uri: string) {
+  return uri.endsWith(".block.css");
+}
 
-documents.onDidChangeContent(async change => {
-  const uri = change.document.uri;
-  // TODO: figure out why this is not working and use it instead of the
-  // following replace hack
-  // const filepath = url.fileURLToPath(uri);
-  const filepath = uri.replace(/^file:\/\//, "");
-  const text = change.document.getText();
-  const extension = filepath.split(".").pop();
+function isTemplateFile(uri: string) {
+  return uri.endsWith(".hbs");
+}
 
-  switch (extension) {
-    case "hbs":
-      const blockPath = filepath
+class PathTranslator {
+  templateFsPath?: string;
+  templateUri?: string;
+  blockFsPath?: string;
+  blockUri?: string;
+
+  constructor(uri: string) {
+    let fsPath = URI.parse(uri).fsPath;
+
+    if (fsPath.endsWith(".hbs")) {
+      this.templateFsPath = fsPath;
+      this.templateUri = uri;
+      this.blockFsPath = fsPath
         .replace(/.hbs$/, ".block.css")
         .replace(
           new RegExp(`${path.sep}templates${path.sep}`),
           `${path.sep}styles${path.sep}`,
         );
-      let block: Block;
+      this.blockUri = URI.file(this.blockFsPath).toString();
+    }
 
-      try {
-        block = await factory.getBlockFromPath(blockPath);
-        interface CSSClassPosition {
-          className: string;
-          range: SourceRange;
-        }
+    if (isBlockFile(uri)) {
+      this.blockFsPath = fsPath;
+      this.blockUri = uri;
+      this.templateFsPath = fsPath
+        .replace(/\.block\.css$/, ".hbs")
+        .replace(
+          new RegExp(`${path.sep}styles${path.sep}`),
+          `${path.sep}templates${path.sep}`,
+        );
+      this.templateUri = URI.file(this.templateFsPath).toString();
+    }
+  }
+}
 
-        let classes: CSSClassPosition[] = [];
-        let match: RegExpExecArray | null;
+async function validateTemplate(uri: string) {
+  const { blockFsPath, templateUri } = new PathTranslator(uri);
 
-        const regex = /class=('|")([^"']*)\1/g;
-        const lines = text.split(/\r?\n/);
+  if (blockFsPath && templateUri) {
+    try {
+      let block = await factory.getBlockFromPath(blockFsPath);
+      let document = documents.get(templateUri);
 
-        lines.forEach((line, index) => {
-          while ((match = regex.exec(line))) {
-            let previousClassName = "";
-            let matchIndexOffset = 8;
-
-            match[2].split(/\s+/).forEach(className => {
-              if (match === null) {
-                return;
-              }
-
-              matchIndexOffset += previousClassName
-                ? previousClassName.length + 1
-                : 0;
-
-              classes.push({
-                className,
-                range: {
-                  start: {
-                    line: index + 1,
-                    column: match.index + matchIndexOffset,
-                  },
-                  end: {
-                    line: index + 1,
-                    column:
-                      match.index + matchIndexOffset + className.length - 1,
-                  },
-                },
-              });
-
-              previousClassName = className;
-            });
-          }
-        });
-
-        let errors: CssBlockError[] = [];
-
-        classes.forEach(obj => {
-          try {
-            const blockName = obj.className.includes(".")
-              ? obj.className
-              : `.${obj.className}`;
-            block.lookup(blockName, obj.range);
-          } catch (error) {
-            errors.push(error);
-          }
-        });
-
-        if (errors.length > 0) {
-          await diagnostics.sendDiagnostics(errors, uri);
-        }
-      } catch (e) {
-        // whatever
+      if (document) {
+        let documentText = document.getText();
+        let errors = hbsErrorParser(documentText, block);
+        await diagnostics.sendDiagnostics(errors, templateUri);
       }
+    } catch (e) {
+      // TODO: use a toast to notify of parsing error?
+      connection.console.warn(e);
+    }
+  }
+}
 
-    case "css":
-      if (!filepath.match(/\.block\.css/)) break;
-      try {
-        await parser.parseSource({
-          identifier: filepath,
-          defaultName: path.parse(filepath).name.replace(/\.block/, ""),
-          originalSource: text,
-          originalSyntax: Syntax.css,
-          parseResult: postcss.parse(text, { from: filepath }),
-          dependencies: [],
-        });
-        await diagnostics.sendDiagnostics([], uri);
-      } catch (e) {
-        if (e instanceof CssBlockError) {
-          await diagnostics.sendDiagnostics([e], uri);
-        }
-      }
-      break;
+function getClassPartsNameAtCursorPosition(
+  document: TextDocument,
+  position: Position,
+): string[] {
+  let text = document.getText();
+  let ast = preprocess(text);
+  let focusedNode = ASTPath.toPosition(ast, toPosition(position));
 
-    default:
+  if (
+    focusedNode &&
+    focusedNode.parent &&
+    focusedNode.parent.type === "AttrNode" &&
+    focusedNode.parent.name === "class"
+  ) {
+    if (focusedNode.node.type === "TextNode") {
+      let focusedColumnInNode =
+        position.character - focusedNode.node.loc.start.column - 1;
+      let textNode = focusedNode.node;
+      let classNameString = textNode.chars;
+      let suffix = classNameString
+        .slice(focusedColumnInNode)
+        .split(/\s+/)
+        .shift();
+      let prefix = classNameString
+        .slice(0, focusedColumnInNode)
+        .split(/\s+/)
+        .reverse()
+        .shift();
+
+      let selectedText = `${prefix}${suffix}`;
+      return selectedText.split(".");
+    }
+  }
+
+  return [];
+}
+
+documents.onDidSave(async e => {
+  factory.reset();
+  await validateTemplate(e.document.uri);
+});
+
+documents.onDidChangeContent(async e => {
+  const { uri } = e.document;
+
+  if (!isBlockFile(uri)) {
+    return;
+  }
+
+  const { fsPath } = URI.parse(uri);
+  const text = e.document.getText();
+
+  try {
+    await parser.parseSource({
+      identifier: fsPath,
+      defaultName: path.parse(fsPath).name.replace(/\.block/, ""),
+      originalSource: text,
+      originalSyntax: Syntax.css,
+      parseResult: postcss.parse(text, { from: fsPath }),
+      dependencies: [],
+    });
+    // clear the errors if nothing is wrong
+    await diagnostics.sendDiagnostics([], uri);
+  } catch (e) {
+    if (e instanceof CssBlockError) {
+      await diagnostics.sendDiagnostics([e], uri);
+    }
   }
 });
 
-// async function sendDiagnostics(
-//   errors: CssBlockError[],
-//   uri: string
-// ): Promise<void> {
-//   let diagnostics: Diagnostic[] = [];
+connection.onDefinition(
+  async (params: TextDocumentPositionParams): Promise<Definition> => {
+    let {
+      position,
+      textDocument: { uri },
+    } = params;
+    let pathTranslator = new PathTranslator(uri);
+    let document = documents.get(uri);
 
-//   errors.forEach(error => {
-//     let range = error.location!;
+    if (document) {
+      if (
+        isTemplateFile(uri) &&
+        pathTranslator.blockUri &&
+        pathTranslator.blockFsPath
+      ) {
+        let classNameParts = getClassPartsNameAtCursorPosition(
+          document,
+          position,
+        );
+        let hasBlockReference = classNameParts.length > 1;
+        let block = await factory.getBlockFromPath(pathTranslator.blockFsPath);
+        let className = hasBlockReference ? classNameParts[1] : classNameParts[0];
+        let blockUri = pathTranslator.blockUri;
+        let blockDocumentText;
 
-//     if (!errorHasRange(range)) {
-//       return;
-//     }
+        if (hasBlockReference) {
+          let referencedBlock = block.getReferencedBlock(classNameParts[0]);
+          if (referencedBlock) {
+            blockUri = URI.file(referencedBlock.identifier).toString();
+            blockDocumentText = fs.readFileSync(referencedBlock.identifier, {
+              encoding: "utf8",
+            });
+          }
+        } else {
+          blockUri = URI.file(block.identifier).toString();
+          blockDocumentText = fs.readFileSync(block.identifier, {
+            encoding: "utf8",
+          });
+        }
 
-//     const diagnostic: Diagnostic = {
-//       severity: DiagnosticSeverity.Error,
-//       range: {
-//         start: {
-//           line: range.start.line - 1,
-//           character: range.start.column - 1
-//         },
-//         end: {
-//           line: range.end.line - 1,
-//           // TODO: explain why we are doing this better. their end character is
-//           // the next character after the end of the range.
-//           character: range.end.column
-//         }
-//       },
-//       message: error.origMessage
-//     };
+        if (blockDocumentText) {
+          let lines = blockDocumentText.split(/\r?\n/);
+          let selectorPositionLine = 0;
 
-//     diagnostics.push(diagnostic);
-//   });
+          lines.forEach((line, i) => {
+            if (new RegExp(className).test(line)) {
+              selectorPositionLine = i;
+            }
+          });
 
-//   // Send the computed diagnostics to the connected client.
-//   connection.sendDiagnostics({ uri, diagnostics });
-// }
+          return {
+            uri: blockUri,
+            range: {
+              start: {
+                line: selectorPositionLine,
+                character: 1,
+              },
+              end: {
+                line: selectorPositionLine,
+                character: 1,
+              },
+            },
+          };
+        }
 
-// This handler provides the initial list of the completion items.
+      }
+    }
+
+    return [];
+  },
+);
+
+// connection.onHover((params: TextDocumentPositionParams): Hover | undefined => {
+//   // TODO: show documentation if it exists
+//   return;
+// });
+
 connection.onCompletion(
   async (params: TextDocumentPositionParams): Promise<CompletionItem[]> => {
     const document = documents.get(params.textDocument.uri);
@@ -315,7 +385,19 @@ connection.onCompletion(
             );
 
           try {
-            const block = await factory.getBlockFromPath(blockPath);
+            let block: Block | null;
+            block = await factory.getBlockFromPath(blockPath);
+            let classNameParts = getClassPartsNameAtCursorPosition(document, params.position);
+            let hasBlockReference = classNameParts.length > 1;
+
+            if (hasBlockReference && block) {
+              block = block.getReferencedBlock(classNameParts[0]);
+            }
+
+            if (block === null) {
+              return [];
+            }
+
             const attributes = block.rootClass.getAttributes();
             let completions = attributes.map(
               (attr): CompletionItem => ({
@@ -325,7 +407,8 @@ connection.onCompletion(
             );
 
             block.classes
-              // TODO: figure out if this is a reliable way to remove :scope
+              // TODO: we should look at scope attributes if the user is on the
+              // root element.
               .filter(blockClass => !blockClass.isRoot)
               .forEach(blockClass => {
                 const classCompletion: CompletionItem = {
