@@ -1,14 +1,14 @@
 import { AST } from "@glimmer/syntax";
 import { Position, SourceLocation } from "estree";
 
-import { containsPosition } from "./estTreeUtils";
+import { containsPosition } from "./util/estTreeUtils";
 
-export class ASTPath {
-  static toPosition(ast: AST.Template, position: Position): ASTPath | null {
+export class GlimmerAstPath {
+  static toPosition(ast: AST.Template, position: Position): GlimmerAstPath | null {
     let path = _findFocusPath(ast, position);
 
     if (path) {
-      return new ASTPath(path);
+      return new GlimmerAstPath(path);
     }
 
     return null;
@@ -24,8 +24,8 @@ export class ASTPath {
     return this.path[this.index - 1];
   }
 
-  get parentPath(): ASTPath | undefined {
-    return new ASTPath(this.path, this.index - 1);
+  get parentPath(): GlimmerAstPath | undefined {
+    return new GlimmerAstPath(this.path, this.index - 1);
   }
 }
 
